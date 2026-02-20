@@ -1,11 +1,12 @@
+# cache_server/commands.py
 from __future__ import annotations
 
-import asyncio
 from typing import Callable
 
+import state as _state_module
 from protocol import BulkString, RESPArray, RESPError, RESPValue, SimpleString
+from state import _lock
 from store import (
-    make_store,
     store_delete,
     store_exists,
     store_get,
@@ -13,9 +14,6 @@ from store import (
     store_set,
     store_ttl,
 )
-
-_store: dict = make_store()
-_lock = asyncio.Lock()
 
 OK = SimpleString("OK")
 PONG = SimpleString("PONG")
@@ -26,8 +24,6 @@ async def handle_ping(args: list[str]) -> RESPValue:
 
 
 async def handle_set(args: list[str]) -> RESPValue:
-    global _store
-
     if len(args) < 2:
         return RESPError("ERR wrong number of arguments for SET")
 
@@ -35,96 +31,68 @@ async def handle_set(args: list[str]) -> RESPValue:
     ttl = None
 
     opts = {args[i].upper(): args[i + 1] for i in range(2, len(args) - 1, 2)}
-
     if "EX" in opts:
-        try:
-            ttl = float(opts["EX"])
-        except ValueError:
-            return RESPError("ERR value is not an integer or out of range")
+        ttl = float(opts["EX"])
     elif "PX" in opts:
-        try:
-            ttl = float(opts["PX"]) / 1_000
-        except ValueError:
-            return RESPError("ERR value is not an integer or out of range")
+        ttl = float(opts["PX"]) / 1000
 
     async with _lock:
-        _store = store_set(_store, key, value, ttl)
-
+        _state_module._store = store_set(_state_module._store, key, value, ttl)
     return OK
 
 
 async def handle_get(args: list[str]) -> RESPValue:
     if not args:
         return RESPError("ERR wrong number of arguments for GET")
-
-    entry = store_get(_store, args[0])
+    entry = store_get(_state_module._store, args[0])
     return BulkString(entry.value if entry else None)
 
 
 async def handle_del(args: list[str]) -> RESPValue:
-    global _store
     async with _lock:
-        _store, count = store_delete(_store, *args)
-
+        _state_module._store, count = store_delete(_state_module._store, *args)
     return count
 
 
 async def handle_exists(args: list[str]) -> RESPValue:
-    return store_exists(_store, *args)
+    return store_exists(_state_module._store, *args)
 
 
 async def handle_keys(args: list[str]) -> RESPValue:
     pattern = args[0] if args else "*"
-
-    keys = store_keys(_store, pattern)
+    keys = store_keys(_state_module._store, pattern)
     return RESPArray(tuple(BulkString(k) for k in keys))
 
 
 async def handle_ttl(args: list[str]) -> RESPValue:
     if not args:
         return RESPError("ERR wrong number of arguments for TTL")
-
-    return store_ttl(_store, args[0])
+    return store_ttl(_state_module._store, args[0])
 
 
 async def handle_incr(args: list[str]) -> RESPValue:
-    global _store
-
     if not args:
         return RESPError("ERR wrong number of arguments for INCR")
-
     key = args[0]
     async with _lock:
-        entry = store_get(_store, key)
-
+        entry = store_get(_state_module._store, key)
         try:
             new_val = int(entry.value if entry else 0) + 1
         except ValueError:
             return RESPError("ERR value is not an integer")
-
-        _store = store_set(_store, key, str(new_val))
-
+        _state_module._store = store_set(_state_module._store, key, str(new_val))
     return new_val
 
 
 async def handle_expire(args: list[str]) -> RESPValue:
-    global _store
-
     if len(args) < 2:
         return RESPError("ERR wrong number of arguments for EXPIRE")
-
-    key = args[0]
-    try:
-        seconds = int(args[1])
-    except ValueError:
-        return RESPError("ERR value is not an integer or out of range")
+    key, seconds = args[0], int(args[1])
     async with _lock:
-        entry = store_get(_store, key)
+        entry = store_get(_state_module._store, key)
         if entry is None:
             return 0
-
-        _store = store_set(_store, key, entry.value, float(seconds))
-
+        _state_module._store = store_set(_state_module._store, key, entry.value, float(seconds))
     return 1
 
 
@@ -140,15 +108,21 @@ COMMAND_REGISTRY: dict[str, Callable] = {
     "EXPIRE": handle_expire,
 }
 
+# Wire in hash commands — imported here (bottom) to avoid circular import
+from hash_commands import HASH_COMMAND_REGISTRY  # noqa: E402
+
+COMMAND_REGISTRY.update(HASH_COMMAND_REGISTRY)
+
+from zset_commands import ZSET_COMMAND_REGISTRY  # noqa: E402
+
+COMMAND_REGISTRY.update(ZSET_COMMAND_REGISTRY)
+
 
 async def dispatch(raw_args: list[str]) -> RESPValue:
     if not raw_args:
         return RESPError("ERR empty command")
-
     cmd = raw_args[0].upper()
     handler = COMMAND_REGISTRY.get(cmd)
-
     if handler is None:
         return RESPError(f"ERR unknown command '{cmd}'")
-
     return await handler(raw_args[1:])
